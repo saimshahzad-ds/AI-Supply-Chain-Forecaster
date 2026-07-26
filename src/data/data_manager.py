@@ -24,6 +24,95 @@ def _get_db_path():
 
 DB_PATH = _get_db_path()
 
+def _ensure_all_tables():
+    """
+    Creates all database tables if they do not exist.
+    Called automatically at module load so the app is fully self-contained —
+    deleting the .db file and restarting the app is enough to reset everything.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS User (
+            user_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            username      TEXT    NOT NULL UNIQUE,
+            password_hash TEXT    NOT NULL,
+            full_name     TEXT,
+            email         TEXT,
+            role          TEXT    NOT NULL DEFAULT 'Staff',
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS FoodItem (
+            item_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_name TEXT NOT NULL UNIQUE,
+            category  TEXT,
+            unit      TEXT NOT NULL DEFAULT 'units'
+        );
+
+        CREATE TABLE IF NOT EXISTS Sales (
+            sale_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id     INTEGER NOT NULL,
+            sale_date   DATE    NOT NULL,
+            quantity    INTEGER NOT NULL,
+            day_of_week TEXT,
+            is_holiday  INTEGER DEFAULT 0,
+            FOREIGN KEY (item_id) REFERENCES FoodItem(item_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS CustomerCount (
+            count_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            count_date     DATE    NOT NULL UNIQUE,
+            customer_count INTEGER NOT NULL,
+            day_of_week    TEXT,
+            is_holiday     INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS Prediction (
+            pred_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id            INTEGER NOT NULL,
+            pred_date          DATE    NOT NULL,
+            predicted_quantity INTEGER NOT NULL,
+            model_used         TEXT,
+            created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (item_id) REFERENCES FoodItem(item_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS InventorySuggestion (
+            suggestion_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id           INTEGER NOT NULL,
+            suggestion_date   DATE    NOT NULL,
+            suggested_quantity INTEGER NOT NULL,
+            raw_material      TEXT,
+            FOREIGN KEY (item_id) REFERENCES FoodItem(item_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS Alert (
+            alert_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id    INTEGER,
+            alert_date DATE    NOT NULL,
+            alert_type TEXT    NOT NULL,
+            message    TEXT    NOT NULL,
+            is_read    INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS Dataset (
+            dataset_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename    TEXT NOT NULL,
+            uploaded_by INTEGER,
+            upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            row_count   INTEGER,
+            notes       TEXT,
+            FOREIGN KEY (uploaded_by) REFERENCES User(user_id)
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+# Run once at import time — safe to call repeatedly (IF NOT EXISTS protects existing data)
+_ensure_all_tables()
+
+
 def _ensure_dataset_table():
     """Auto-create Dataset table if it doesn't exist (backwards compatibility)."""
     conn = sqlite3.connect(DB_PATH)
@@ -220,6 +309,7 @@ def bulk_upload_sales(df, uploaded_by_user_id=None, filename="unknown"):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     count = 0
+    seen_dates_cc = {}  # track dates already written to CustomerCount to avoid duplicates
 
     for _, row in df.iterrows():
         item_name = row.get('Item') or row.get('item_name') or row.get('FoodItem')
@@ -247,6 +337,28 @@ def bulk_upload_sales(df, uploaded_by_user_id=None, filename="unknown"):
                 (item_id, date_str, int(quantity), day_of_week, holiday_flag)
             )
             count += 1
+
+            # ── Import Customer Count from CSV if column exists ──
+            # Each date appears multiple times (once per item), so we only write it once
+            if date_str not in seen_dates_cc:
+                customer_count = (
+                    row.get('Customer Count') or
+                    row.get('customer_count') or
+                    row.get('CustomerCount') or
+                    row.get('Customers')
+                )
+                if customer_count:
+                    seen_dates_cc[date_str] = True
+                    try:
+                        cursor.execute(
+                            "INSERT INTO CustomerCount (count_date, customer_count, day_of_week, is_holiday) VALUES (?, ?, ?, ?)",
+                            (date_str, int(float(customer_count)), day_of_week, holiday_flag)
+                        )
+                    except Exception:
+                        cursor.execute(
+                            "UPDATE CustomerCount SET customer_count = ?, day_of_week = ?, is_holiday = ? WHERE count_date = ?",
+                            (int(float(customer_count)), day_of_week, holiday_flag, date_str)
+                        )
 
     conn.commit()
     conn.close()

@@ -175,8 +175,11 @@ def generate_all_predictions(model_type="ARIMA"):
         if pred is not None:
             item_forecasts[item] = np.round(pred).astype(int).tolist()
 
+    from datetime import date as _date
     last_date = customer_series.index[-1]
-    date_strs = [(last_date + timedelta(days=i + 1)).strftime('%Y-%m-%d') for i in range(forecast_days)]
+    today     = pd.Timestamp(_date.today())
+    start     = max(last_date, today)   # never show past dates in forecast
+    date_strs = [(start + timedelta(days=i + 1)).strftime('%Y-%m-%d') for i in range(forecast_days)]
 
     return {
         'dates':             date_strs,

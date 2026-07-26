@@ -9,11 +9,11 @@ my_env\Scripts\activate
 2. Upgrade pip and install dependencies
 python -m pip install --upgrade pip
 pip install streamlit
-pip install pandas
 pip install plotly
 pip install xgboost
 pip install statsmodels
 pip install tensorflow-cpu
+pip install openpyxl
 pip install bcrypt
 
 3. Initialize the database (Required on first run to build tables)
