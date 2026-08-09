@@ -57,7 +57,6 @@ def get_daily_sales_per_item():
     if df.empty or df.shape[1] < 3:
         return {}
 
-    # Use named columns - get_all_sales returns: sale_date, item_name, quantity, ...
     if 'sale_date' in df.columns and 'item_name' in df.columns and 'quantity' in df.columns:
         date_col, item_col, qty_col = 'sale_date', 'item_name', 'quantity'
     else:
@@ -144,33 +143,159 @@ def train_lstm(series, forecast_days=7, window=7):
     return np.maximum(scaler.inverse_transform(np.array(forecasts).reshape(-1, 1)).flatten(), 0)
 
 
-def generate_all_predictions(model_type="ARIMA"):
+def train_naive(series, forecast_days=7, season=7):
+    """Seasonal-naive baseline: forecast = actual value from `season` days earlier
+    (i.e. same day last week). Falls back to repeating the last value if there
+    isn't a full season of history."""
+    if series is None or len(series) < 1:
+        return None
+    values = list(series.values.astype(float))
+    if len(values) < season:
+        last_val = values[-1]
+        return np.maximum(np.array([last_val] * forecast_days), 0)
+
+    extended = values[:]
+    forecasts = []
+    for _ in range(forecast_days):
+        next_val = extended[-season]
+        forecasts.append(next_val)
+        extended.append(next_val)
+    return np.maximum(np.array(forecasts), 0)
+
+
+# All four functions share the same (series, forecast_days) signature.
+MODEL_FUNCS = {
+    "ARIMA":   train_arima,
+    "XGBoost": train_xgboost,
+    "LSTM":    train_lstm,
+    "Naive":   train_naive,
+}
+
+
+def train_test_split_series(series, test_days=7):
+    """Hold out the last `test_days` observations as a test set. Returns (train, test)."""
+    if series is None or len(series) < test_days + 3:
+        raise ValueError(
+            f"Need at least {test_days + 3} days of data to hold out "
+            f"{test_days} test days (found {0 if series is None else len(series)})."
+        )
+    train = series.iloc[:-test_days]
+    test = series.iloc[-test_days:]
+    return train, test
+
+
+def calculate_error_metrics(actual, predicted):
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    if len(actual) == 0 or len(predicted) == 0 or len(actual) != len(predicted):
+        return {"MAE": None, "RMSE": None, "MAPE": None}
+
+    errors = actual - predicted
+    mae = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+    denom = np.maximum(np.abs(actual), 1.0)  # avoid divide-by-zero on zero-sales days
+    mape = float(np.mean(np.abs(errors) / denom) * 100)
+
+    return {"MAE": round(mae, 3), "RMSE": round(rmse, 3), "MAPE": round(mape, 2)}
+
+
+def backtest_series(series, model_type, test_days=7, **model_kwargs):
+    """Fit on everything except the last `test_days`, forecast that window, score it.
+    Returns None if there isn't enough data or the model failed to fit."""
+    try:
+        train, test = train_test_split_series(series, test_days=test_days)
+    except ValueError:
+        return None
+
+    fn = MODEL_FUNCS.get(model_type)
+    if fn is None:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+    predicted = fn(train, test_days, **model_kwargs)
+    if predicted is None:
+        return None
+
+    predicted = np.asarray(predicted)[:len(test)]
+    actual = test.values[:len(predicted)]
+    if len(predicted) == 0 or len(predicted) != len(actual):
+        return None
+
+    metrics = calculate_error_metrics(actual, predicted)
+    return {
+        "model": model_type,
+        "test_days": len(actual),
+        "actual": actual.tolist(),
+        "predicted": np.round(predicted, 2).tolist(),
+        **metrics,
+    }
+
+
+def evaluate_models(model_types=("ARIMA", "XGBoost", "LSTM"), test_days=7, include_baseline=True):
+    """Backtest each model (plus Naive baseline) for the customer series and every item.
+    Returns a DataFrame: [series, model, test_days, MAE, RMSE, MAPE]."""
+    rows = []
+    models_to_run = list(model_types)
+    if include_baseline and "Naive" not in models_to_run:
+        models_to_run.append("Naive")
+
+    try:
+        customer_series = get_daily_customer_series()
+        for model_type in models_to_run:
+            result = backtest_series(customer_series, model_type, test_days=test_days)
+            if result:
+                rows.append({
+                    "series": "Customer Count",
+                    "model": result["model"],
+                    "test_days": result["test_days"],
+                    "MAE": result["MAE"],
+                    "RMSE": result["RMSE"],
+                    "MAPE": result["MAPE"],
+                })
+    except ValueError:
+        pass
+
+    for item, series in get_daily_sales_per_item().items():
+        if len(series) < test_days + 3:
+            continue
+        for model_type in models_to_run:
+            result = backtest_series(series, model_type, test_days=test_days)
+            if result:
+                rows.append({
+                    "series": item,
+                    "model": result["model"],
+                    "test_days": result["test_days"],
+                    "MAE": result["MAE"],
+                    "RMSE": result["RMSE"],
+                    "MAPE": result["MAPE"],
+                })
+
+    return pd.DataFrame(rows, columns=["series", "model", "test_days", "MAE", "RMSE", "MAPE"])
+
+
+def generate_all_predictions(model_type="ARIMA", forecast_days=7):
     try:
         customer_series = get_daily_customer_series()
     except ValueError as e:
         raise ValueError(f"Customer data error: {e}")
 
-    forecast_days = 7
-    if model_type == "ARIMA":
-        cust_forecast = train_arima(customer_series, forecast_days)
-    elif model_type == "XGBoost":
-        cust_forecast = train_xgboost(customer_series, forecast_days)
-    elif model_type == "LSTM":
-        cust_forecast = train_lstm(customer_series, forecast_days)
-    else:
-        raise ValueError("model_type must be one of: ARIMA, XGBoost, LSTM")
+    valid_models = ("ARIMA", "XGBoost", "LSTM", "Naive")
+    if model_type not in valid_models:
+        raise ValueError(f"model_type must be one of: {', '.join(valid_models)}")
+    fn = MODEL_FUNCS[model_type]
+
+    cust_forecast = fn(customer_series, forecast_days)
 
     if cust_forecast is None:
         raise ValueError(
-            f"{model_type} could not generate a forecast. "
-            "Add more historical data (ARIMA: 3+ days, XGBoost/LSTM: 14+ days)."
+            f"{model_type} could not generate a forecast for {forecast_days} days. "
+            "Add more historical data (ARIMA: 3+ days, XGBoost/LSTM: 14+ days, "
+            "and generally more history than the forecast horizon itself)."
         )
 
     item_forecasts = {}
     for item, series in get_daily_sales_per_item().items():
         if len(series) < 7:
             continue
-        fn   = {"ARIMA": train_arima, "XGBoost": train_xgboost, "LSTM": train_lstm}[model_type]
         pred = fn(series, forecast_days)
         if pred is not None:
             item_forecasts[item] = np.round(pred).astype(int).tolist()

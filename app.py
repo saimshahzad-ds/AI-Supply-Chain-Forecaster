@@ -16,9 +16,9 @@ from data.data_manager import (
     add_sale, add_customer_count, get_all_sales, get_customer_counts,
     bulk_upload_sales, get_predictions, get_inventory_suggestions,
     get_alerts, generate_demand_alerts, save_inventory_suggestion,
-    get_dataset_uploads
+    get_dataset_uploads, save_prediction
 )
-from models.predictor import generate_all_predictions, get_prediction_summary
+from models.predictor import generate_all_predictions, get_prediction_summary, evaluate_models
 
 # ── Page Config ──
 st.set_page_config(page_title="SCM Forecaster", page_icon="📊", layout="wide")
@@ -124,6 +124,7 @@ for key, default in [
     ("user", None),
     ("page", "Dashboard"),
     ("predictions", None),
+    ("eval_df", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -148,6 +149,28 @@ def subtitle(text):
 
 def info_text(text):
     st.markdown(f'<p style="color:#444444;font-size:0.9rem;">{text}</p>', unsafe_allow_html=True)
+
+def persist_predictions(results):
+    """
+    Fix #6: generate_all_predictions() only returns forecasts in memory -
+    nothing ever called save_prediction(), so the Prediction table stayed
+    empty. This writes every (item, date, predicted_quantity) triple to the
+    database so forecasts survive a restart and show up in get_predictions().
+    Returns the number of rows saved.
+    """
+    if not results or not results.get("item_forecasts"):
+        return 0
+    dates      = results["dates"]
+    model_used = results.get("model_used", "N/A")
+    saved      = 0
+    for item_name, forecast in results["item_forecasts"].items():
+        item_id = get_food_item_by_name(item_name)
+        if item_id is None:
+            continue
+        for pred_date, predicted_quantity in zip(dates, forecast):
+            save_prediction(item_id, pred_date, int(predicted_quantity), model_used)
+            saved += 1
+    return saved
 
 # ════════════════════════════════════════════════════════
 # LOGIN
@@ -188,8 +211,7 @@ def show_login():
             
             if st.button("Create Account", use_container_width=True, type="primary"):
                 if new_user and new_pass:
-                    # Hardcoded "Staff" role for all new sign-ups to enforce RBAC
-                    success, msg = create_user(new_user, new_pass, "Staff", new_name)
+                    success, msg = create_user(new_user, new_pass, "Staff", new_name)  # sign-ups always get Staff role
                     st.success(msg + " Go to Login tab.") if success else st.error(msg)
                 else:
                     st.warning("Please fill all required fields")
@@ -361,24 +383,25 @@ def page_upload_dataset():
         st.success(f"File loaded: {uploaded_file.name}")
         st.subheader("Data Preview")
         
-        # Fixed table implementation
         st.table(df.head(10).set_index(df.columns[0]))
         
         info_text(f"Total rows: {len(df)}")
-        st.markdown("**Expected columns:** `Date`, `Item`, `Quantity`")
+        info_text(
+            "Columns are matched automatically (e.g. `Qty`, `Product`, `Order Date` all work) - "
+            "no need for exact names. Multiple rows for the same item/date are aggregated automatically."
+        )
 
         if st.button("Save to Database", use_container_width=True, type="primary"):
             count = bulk_upload_sales(df, uploaded_by_user_id=st.session_state.user['user_id'], filename=uploaded_file.name)
             if count > 0:
-                st.success(f"Saved {count} sales records. Holiday flags auto-applied.")
+                st.success(f"Saved {count} sales records (after cleaning/aggregating duplicates). Holiday flags auto-applied.")
             else:
-                st.warning("No records saved. Check column names: Date, Item, Quantity.")
+                st.warning("No records saved - see the message above for details.")
 
     st.divider()
     st.subheader("Upload History")
     uploads = get_dataset_uploads()
     if not uploads.empty:
-        # Fixed table implementation
         st.table(uploads.set_index(uploads.columns[0]))
     else:
         info_text("No uploads yet.")
@@ -403,7 +426,6 @@ def page_data_entry():
     with tab1:
         col1, col2, col3 = st.columns(3)
         with col1:
-            # THIS IS THE NEW VALIDATION LINE THAT BLOCKS FUTURE DATES
             entry_date = st.date_input("Date", value=date.today(), max_value=date.today())
         with col2:
             food_item = st.selectbox("Food Item", item_names)
@@ -439,7 +461,6 @@ def page_data_entry():
     st.subheader("Recent Sales")
     sales_df = get_all_sales()
     if not sales_df.empty:
-        # Fixed table implementation
         st.table(sales_df.head(20).set_index(sales_df.columns[0]))
     else:
         info_text("No sales data yet.")
@@ -452,12 +473,15 @@ def page_prediction_model():
     subtitle("Configure and run the AI demand forecasting model")
     st.divider()
 
+    FORECAST_PERIOD_DAYS = {"Next 7 Days": 7, "Next 14 Days": 14, "Next 30 Days": 30}
+
     col1, col2 = st.columns(2)
     with col1:
         model_type = st.selectbox("Select Model", ["ARIMA", "XGBoost", "LSTM"])
     with col2:
-        st.selectbox("Forecast Period", ["Next 7 Days", "Next 14 Days", "Next 30 Days"])
-        info_text("Note: 14 and 30-day forecasts repeat the 7-day cycle.")
+        forecast_period = st.selectbox("Forecast Period", list(FORECAST_PERIOD_DAYS.keys()))
+        forecast_days = FORECAST_PERIOD_DAYS[forecast_period]
+        info_text(f"Model will be trained to forecast {forecast_days} days ahead.")
 
     st.markdown('<style>details summary p { color:#1a1a2e !important; font-weight:700 !important; font-size:1rem !important; }</style>', unsafe_allow_html=True)
     with st.expander("Data Preprocessing Details"):
@@ -476,19 +500,18 @@ def page_prediction_model():
     st.divider()
 
     if st.button("Generate Predictions", use_container_width=True, type="primary"):
-        with st.spinner("Preprocessing data and training model..."):
+        with st.spinner(f"Preprocessing data and training model for {forecast_days} days..."):
             try:
-                results = generate_all_predictions(model_type)
+                results = generate_all_predictions(model_type, forecast_days)
                 if results and results.get("customer_forecast"):
                     st.session_state.predictions = results
                     generate_demand_alerts(results, model_used=model_type)
-                    
-                    # Vibrant Custom Alert (Softer Emerald Green, No Emoji)
-                    st.markdown('<div style="background-color:#059669; color:white; padding:16px; border-radius:8px; font-weight:700; font-size:1.1rem; box-shadow:0 4px 6px rgba(0,0,0,0.1); border-left:6px solid #047857; margin-bottom:15px;">Predictions generated! Alerts updated. Go to View Predictions.</div>', unsafe_allow_html=True)
+                    saved_count = persist_predictions(results)
+
+                    st.markdown(f'<div style="background-color:#059669; color:white; padding:16px; border-radius:8px; font-weight:700; font-size:1.1rem; box-shadow:0 4px 6px rgba(0,0,0,0.1); border-left:6px solid #047857; margin-bottom:15px;">Predictions generated for {forecast_days} days! {saved_count} forecast rows saved to database. Alerts updated. Go to View Predictions.</div>', unsafe_allow_html=True)
                     
                     st.subheader("Quick Preview")
                     
-                    # Fixed table implementation
                     preview_df = pd.DataFrame({
                         "Date": results["dates"],
                         "Predicted Customers": results["customer_forecast"]
@@ -503,15 +526,15 @@ def page_prediction_model():
     st.subheader("Retrain Model")
     if st.session_state.user['role'] == 'Admin':
         if st.button("Retrain with New Data", use_container_width=True):
-            with st.spinner("Retraining..."):
+            with st.spinner(f"Retraining for {forecast_days} days..."):
                 try:
-                    results = generate_all_predictions(model_type)
+                    results = generate_all_predictions(model_type, forecast_days)
                     if results and results.get("customer_forecast"):
                         st.session_state.predictions = results
                         generate_demand_alerts(results, model_used=model_type)
-                        
-                        # Vibrant Custom Alert (Softer Emerald Green, No Emoji)
-                        st.markdown('<div style="background-color:#059669; color:white; padding:16px; border-radius:8px; font-weight:700; font-size:1.1rem; box-shadow:0 4px 6px rgba(0,0,0,0.1); border-left:6px solid #047857; margin-bottom:15px;">Model retrained and alerts refreshed!</div>', unsafe_allow_html=True)
+                        saved_count = persist_predictions(results)
+
+                        st.markdown(f'<div style="background-color:#059669; color:white; padding:16px; border-radius:8px; font-weight:700; font-size:1.1rem; box-shadow:0 4px 6px rgba(0,0,0,0.1); border-left:6px solid #047857; margin-bottom:15px;">Model retrained and alerts refreshed! {saved_count} forecast rows saved.</div>', unsafe_allow_html=True)
                     else:
                         st.warning("Not enough data to retrain.")
                 except Exception as e:
@@ -519,24 +542,97 @@ def page_prediction_model():
     else:
         st.info("Retraining is restricted to Admins.")
 
+    # ── Model Evaluation: train/test split + MAE/RMSE/MAPE vs Naive baseline ──
+    st.divider()
+    st.subheader("Model Evaluation (Backtest)")
+    info_text(
+        "Holds out the most recent days as a test set, retrains each model on the "
+        "remaining history, forecasts the held-out window, and scores it against what "
+        "actually happened - including a Naive 'same day last week' baseline so you can "
+        "prove the ML models are actually adding value."
+    )
+
+    eval_col1, eval_col2 = st.columns(2)
+    with eval_col1:
+        test_days = st.slider("Test / holdout days", min_value=3, max_value=14, value=7)
+    with eval_col2:
+        eval_models = st.multiselect(
+            "Models to backtest",
+            ["ARIMA", "XGBoost", "LSTM"],
+            default=["ARIMA", "XGBoost"],
+            help="LSTM retrains a neural net per item/series, so it's the slowest to backtest."
+        )
+
+    if st.button("Run Backtest & Evaluation", use_container_width=True):
+        if not eval_models:
+            st.warning("Select at least one model to backtest.")
+        else:
+            with st.spinner(f"Backtesting {', '.join(eval_models)} + Naive baseline over the last {test_days} days..."):
+                try:
+                    eval_df = evaluate_models(model_types=eval_models, test_days=test_days, include_baseline=True)
+                    if eval_df.empty:
+                        st.warning(
+                            "Not enough historical data to backtest yet. "
+                            f"Each series needs at least {test_days + 3} days of history."
+                        )
+                    else:
+                        st.session_state["eval_df"] = eval_df
+                except Exception as e:
+                    st.error(f"Error running evaluation: {str(e)}")
+
+    if st.session_state.get("eval_df") is not None and not st.session_state["eval_df"].empty:
+        eval_df = st.session_state["eval_df"]
+
+        st.markdown("**Per-series results**")
+        st.table(eval_df.set_index(["series", "model"]))
+
+        st.markdown("**Average error by model (lower is better)**")
+        model_avg = eval_df.groupby("model")[["MAE", "RMSE", "MAPE"]].mean().round(2)
+        st.table(model_avg)
+
+        if "Naive" in model_avg.index:
+            naive_mae = model_avg.loc["Naive", "MAE"]
+            beat_baseline = model_avg.drop(index="Naive")[model_avg.drop(index="Naive")["MAE"] < naive_mae]
+            if not beat_baseline.empty:
+                st.success(
+                    "Beats the Naive baseline on average MAE: " +
+                    ", ".join(beat_baseline.index.tolist())
+                )
+            else:
+                st.warning(
+                    "No model currently beats the Naive 'same day last week' baseline on average MAE. "
+                    "This usually means more historical data or feature tuning is needed."
+                )
+
+        st.download_button(
+            label="Download Evaluation Report (Excel)",
+            data=df_to_excel_bytes({"Model Evaluation": eval_df, "Average by Model": model_avg.reset_index()}),
+            file_name=f"model_evaluation_{date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
 # ════════════════════════════════════════════════════════
 # PAGE: VIEW PREDICTIONS
 # ════════════════════════════════════════════════════════
 def page_view_predictions():
     st.markdown('<p class="page-title">View Predictions</p>', unsafe_allow_html=True)
-    subtitle("7-Day Demand Forecast")
-    st.divider()
 
     if not st.session_state.predictions:
+        subtitle("Demand Forecast")
+        st.divider()
         st.info("No predictions yet. Go to Prediction Model to generate forecasts.")
         return
 
-    preds   = st.session_state.predictions
-    summary = get_prediction_summary(preds)
+    preds       = st.session_state.predictions
+    summary     = get_prediction_summary(preds)
+    n_days      = len(preds.get('dates', []))
+    subtitle(f"{n_days}-Day Demand Forecast")
+    st.divider()
 
     c1, c2, c3 = st.columns(3)
     for col, label, key in [
-        (c1, "Total Customers (7 days)", "total_customers_next_week"),
+        (c1, f"Total Customers ({n_days} days)", "total_customers_next_week"),
         (c2, "Avg Daily Customers",       "avg_daily_customers"),
         (c3, "Items Forecasted",          "items_with_forecast"),
     ]:
@@ -627,13 +723,21 @@ def page_view_predictions():
             summary_data.append({"Item": item, "Avg Daily Demand": int(avg_d),
                                   "Total Weekly": sum(forecast), "Demand Level": status})
         
-        # Fixed table implementation
         summary_df = pd.DataFrame(summary_data)
         if not summary_df.empty:
             summary_df = summary_df.set_index('Item')
         st.table(summary_df)
     else:
         st.info("No item-wise predictions. Add more sales data.")
+
+    st.divider()
+    st.subheader("Saved Predictions (from Database)")
+    saved_preds = get_predictions()
+    if not saved_preds.empty:
+        info_text(f"{len(saved_preds)} prediction rows currently stored in the database.")
+        st.table(saved_preds.tail(20).set_index(saved_preds.columns[0]))
+    else:
+        info_text("No predictions saved yet - generate a forecast on the Prediction Model page.")
 
     st.divider()
     st.subheader("Download Forecast Report")
@@ -681,7 +785,6 @@ def page_inventory_report():
 
     if inventory_rows:
         inv_df = pd.DataFrame(inventory_rows)
-        # Fixed table implementation
         st.table(inv_df.set_index('Food Item'))
 
         st.subheader("Raw Material Orders Needed")
@@ -738,7 +841,6 @@ def page_inventory_report():
     if not saved.empty:
         st.divider()
         st.subheader("Saved Suggestions (from DB)")
-        # Fixed table implementation
         st.table(saved.set_index(saved.columns[0]))
 
 # ════════════════════════════════════════════════════════
@@ -759,7 +861,6 @@ def page_manage_users():
 
     st.subheader("All Users")
     
-    # Fixed table implementation
     users_df = pd.DataFrame([
         {"ID": u[0], "Username": u[1], "Full Name": u[2], "Email": u[3], "Role": u[4], "Created At": u[5]}
         for u in users

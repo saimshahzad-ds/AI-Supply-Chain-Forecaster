@@ -1,15 +1,14 @@
 # src/data/data_manager.py
 import sqlite3
 import os
+import re
+import difflib
 import pandas as pd
 from datetime import datetime
 import streamlit as st  # Added for frontend warnings during bulk upload
 
 def _get_db_path():
-    """
-    Find scm_forecaster.db by searching from CWD upward.
-    This works regardless of where streamlit run is called from.
-    """
+    """Search from CWD upward so this works regardless of where streamlit run is called from."""
     search_paths = [
         os.path.join(os.getcwd(), "database", "scm_forecaster.db"),
         os.path.join(os.getcwd(), "scm_forecaster.db"),
@@ -19,17 +18,12 @@ def _get_db_path():
     for p in search_paths:
         if os.path.exists(p):
             return os.path.abspath(p)
-    # Default — will be created here if it doesn't exist yet
     return os.path.abspath(search_paths[0])
 
 DB_PATH = _get_db_path()
 
 def _ensure_all_tables():
-    """
-    Creates all database tables if they do not exist.
-    Called automatically at module load so the app is fully self-contained —
-    deleting the .db file and restarting the app is enough to reset everything.
-    """
+    """Create all tables if missing. Runs at import time; deleting the .db file resets everything."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.executescript("""
@@ -109,7 +103,6 @@ def _ensure_all_tables():
     conn.commit()
     conn.close()
 
-# Run once at import time — safe to call repeatedly (IF NOT EXISTS protects existing data)
 _ensure_all_tables()
 
 
@@ -131,23 +124,15 @@ def _ensure_dataset_table():
     conn.commit()
     conn.close()
 
-# ---- Pakistani Holidays (Ramadan/Eid approximations) ----
-# These are approximate dates — update yearly as needed
+# Approximate Pakistani holiday dates - update yearly.
 PAKISTANI_HOLIDAYS = {
-    # Eid ul-Fitr 2024
-    "2024-04-10", "2024-04-11", "2024-04-12",
-    # Eid ul-Adha 2024
-    "2024-06-17", "2024-06-18", "2024-06-19",
-    # Pakistan Independence Day
-    "2024-08-14",
-    # Eid Milad-un-Nabi 2024
-    "2024-09-16",
-    # Eid ul-Fitr 2025
-    "2025-03-31", "2025-04-01", "2025-04-02",
-    # Eid ul-Adha 2025
-    "2025-06-07", "2025-06-08", "2025-06-09",
-    # Pakistan Independence Day 2025
-    "2025-08-14",
+    "2024-04-10", "2024-04-11", "2024-04-12",  # Eid ul-Fitr 2024
+    "2024-06-17", "2024-06-18", "2024-06-19",  # Eid ul-Adha 2024
+    "2024-08-14",                              # Independence Day 2024
+    "2024-09-16",                              # Eid Milad-un-Nabi 2024
+    "2025-03-31", "2025-04-01", "2025-04-02",  # Eid ul-Fitr 2025
+    "2025-06-07", "2025-06-08", "2025-06-09",  # Eid ul-Adha 2025
+    "2025-08-14",                              # Independence Day 2025
 }
 
 def is_pakistani_holiday(date_str):
@@ -249,7 +234,6 @@ def add_customer_count(count_date, customer_count, day_of_week=None, is_holiday=
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        # Update if date already exists
         cursor.execute(
             "UPDATE CustomerCount SET customer_count = ?, day_of_week = ?, is_holiday = ? WHERE count_date = ?",
             (customer_count, day_of_week, is_holiday, date_str)
@@ -291,79 +275,178 @@ def get_dataset_uploads():
     return df
 
 # ---- Bulk Upload from CSV/Excel ----
+
+# Synonym lists for fuzzy column matching against messy POS export headers.
+COLUMN_ALIASES = {
+    'item':           ['item', 'item_name', 'fooditem', 'food_item', 'product',
+                        'product_name', 'menu_item', 'dish', 'sku', 'name'],
+    'quantity':       ['quantity', 'qty', 'amount', 'units', 'units_sold',
+                        'sold', 'count', 'sales', 'unitssold'],
+    'date':           ['date', 'sale_date', 'order_date', 'transaction_date',
+                        'saledate', 'orderdate', 'day', 'timestamp'],
+    'customer_count':  ['customer count', 'customer_count', 'customercount',
+                        'customers', 'footfall', 'visitors', 'foot_traffic',
+                        'walkins', 'walk_ins'],
+}
+
+
+def _normalize_col(col):
+    """Lowercase + strip non-alphanumerics so 'Order Date' == 'order_date' == 'OrderDate'."""
+    return re.sub(r'[^a-z0-9]', '', str(col).lower())
+
+
+def _match_column(df_columns, target_key):
+    """Match a column to a canonical field via exact alias, substring, or closest difflib match."""
+    normalized = {_normalize_col(c): c for c in df_columns}
+    aliases = [_normalize_col(a) for a in COLUMN_ALIASES[target_key]]
+
+    # 1. Exact alias match
+    for alias in aliases:
+        if alias in normalized:
+            return normalized[alias]
+            
+    # 2. Substring fallback (The Upgrade)
+    # Automatically catches "date" inside "date_of_sale" or "item" inside "food_item_name"
+    target_base = _normalize_col(target_key)
+    for norm_col, orig_col in normalized.items():
+        if target_base in norm_col:
+            return orig_col
+
+    # 3. Fuzzy match
+    best_col, best_score = None, 0.0
+    for norm_col, orig_col in normalized.items():
+        for alias in aliases:
+            score = difflib.SequenceMatcher(None, norm_col, alias).ratio()
+            if score > best_score:
+                best_score, best_col = score, orig_col
+    return best_col if best_score >= 0.72 else None
+
+
+def _clean_numeric(value):
+    """Strip currency/commas/units from a value and return a float, or None. e.g. "Rs. 1,200" -> 1200.0"""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if not pd.isna(value) else None
+    s = str(value).strip()
+    if not s:
+        return None
+    cleaned = re.sub(r'[^0-9.\-]', '', s)
+    if cleaned in ('', '-', '.', '-.'):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def bulk_upload_sales(df, uploaded_by_user_id=None, filename="unknown"):
-    # --- NEW VALIDATION CODE: Strip out future dates ---
-    date_col = next((col for col in ['Date', 'date', 'sale_date'] if col in df.columns), None)
-    if date_col:
-        df['temp_date'] = pd.to_datetime(df[date_col], errors='coerce')
-        today = pd.Timestamp(datetime.now().date())
-        
-        original_len = len(df)
-        df = df[df['temp_date'] <= today]
-        dropped_rows = original_len - len(df)
-        
-        if dropped_rows > 0:
-            st.warning(f"Blocked {dropped_rows} rows containing future dates to protect database integrity.")
-    # ---------------------------------------------------
+    """Import a sales CSV/Excel export: fuzzy-matches messy headers, cleans dirty
+    numeric fields, aggregates duplicate item/date rows, and drops future dates."""
+    if df is None or df.empty:
+        st.warning("The uploaded file is empty.")
+        return 0
+
+    df = df.copy()
+
+    item_col = _match_column(df.columns, 'item')
+    qty_col  = _match_column(df.columns, 'quantity')
+    date_col = _match_column(df.columns, 'date')
+    cust_col = _match_column(df.columns, 'customer_count')
+
+    missing = [name for name, col in
+               [('item', item_col), ('quantity', qty_col), ('date', date_col)] if not col]
+    if missing:
+        st.error(
+            f"Could not confidently match columns for: {', '.join(missing)}. "
+            f"Found columns in file: {list(df.columns)}. "
+            "Rename headers to something like Item/Product, Quantity/Qty, Date and re-upload."
+        )
+        return 0
+
+    df['_item'] = df[item_col].astype(str).str.strip()
+    df['_qty']  = df[qty_col].apply(_clean_numeric)
+    df['_date'] = pd.to_datetime(df[date_col], errors='coerce')
+    df['_cust'] = df[cust_col].apply(_clean_numeric) if cust_col else None
+
+    before = len(df)
+    df = df[
+        df['_item'].ne('') & df['_item'].str.lower().ne('nan') &
+        df['_qty'].notna() & df['_date'].notna()
+    ]
+    dropped_dirty = before - len(df)
+    if dropped_dirty > 0:
+        st.warning(f"Skipped {dropped_dirty} rows with missing/unreadable item, quantity, or date.")
+
+    # block future dates to protect database integrity
+    today = pd.Timestamp(datetime.now().date())
+    before = len(df)
+    df = df[df['_date'] <= today]
+    dropped_future = before - len(df)
+    if dropped_future > 0:
+        st.warning(f"Blocked {dropped_future} rows containing future dates to protect database integrity.")
+
+    if df.empty:
+        return 0
+
+    df['_date_str'] = df['_date'].dt.strftime('%Y-%m-%d')
+
+    # aggregate duplicate (item, date) rows so multiple receipts/day become one row
+    sales_agg = df.groupby(['_item', '_date_str'], as_index=False)['_qty'].sum()
+
+    cust_agg = {}
+    if cust_col:
+        cust_df = df.dropna(subset=['_cust'])
+        if not cust_df.empty:
+            cust_agg = cust_df.groupby('_date_str')['_cust'].max().to_dict()
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     count = 0
-    seen_dates_cc = {}  # track dates already written to CustomerCount to avoid duplicates
+    try:
+        for _, row in sales_agg.iterrows():
+            item_name = row['_item']
+            date_str  = row['_date_str']
+            quantity  = int(round(row['_qty']))
 
-    for _, row in df.iterrows():
-        item_name = row.get('Item') or row.get('item_name') or row.get('FoodItem')
-        quantity = row.get('Quantity') or row.get('quantity') or row.get('Qty')
-        sale_date = row.get('Date') or row.get('sale_date') or row.get('date')
-
-        if item_name and quantity and sale_date:
-            cursor.execute("SELECT item_id FROM FoodItem WHERE item_name = ?", (str(item_name),))
+            cursor.execute("SELECT item_id FROM FoodItem WHERE item_name = ?", (item_name,))
             result = cursor.fetchone()
             if result:
                 item_id = result[0]
             else:
                 cursor.execute(
                     "INSERT INTO FoodItem (item_name, category, unit) VALUES (?, ?, ?)",
-                    (str(item_name), "General", "units")
+                    (item_name, "General", "units")
                 )
                 item_id = cursor.lastrowid
 
-            date_str = str(sale_date)[:10]
-            day_of_week = pd.to_datetime(date_str).strftime("%A")
+            day_of_week  = pd.to_datetime(date_str).strftime("%A")
             holiday_flag = is_pakistani_holiday(date_str)
 
             cursor.execute(
                 "INSERT INTO Sales (item_id, sale_date, quantity, day_of_week, is_holiday) VALUES (?, ?, ?, ?, ?)",
-                (item_id, date_str, int(quantity), day_of_week, holiday_flag)
+                (item_id, date_str, quantity, day_of_week, holiday_flag)
             )
             count += 1
 
-            # ── Import Customer Count from CSV if column exists ──
-            # Each date appears multiple times (once per item), so we only write it once
-            if date_str not in seen_dates_cc:
-                customer_count = (
-                    row.get('Customer Count') or
-                    row.get('customer_count') or
-                    row.get('CustomerCount') or
-                    row.get('Customers')
+        for date_str, customer_count in cust_agg.items():
+            day_of_week  = pd.to_datetime(date_str).strftime("%A")
+            holiday_flag = is_pakistani_holiday(date_str)
+            try:
+                cursor.execute(
+                    "INSERT INTO CustomerCount (count_date, customer_count, day_of_week, is_holiday) VALUES (?, ?, ?, ?)",
+                    (date_str, int(round(customer_count)), day_of_week, holiday_flag)
                 )
-                if customer_count:
-                    seen_dates_cc[date_str] = True
-                    try:
-                        cursor.execute(
-                            "INSERT INTO CustomerCount (count_date, customer_count, day_of_week, is_holiday) VALUES (?, ?, ?, ?)",
-                            (date_str, int(float(customer_count)), day_of_week, holiday_flag)
-                        )
-                    except Exception:
-                        cursor.execute(
-                            "UPDATE CustomerCount SET customer_count = ?, day_of_week = ?, is_holiday = ? WHERE count_date = ?",
-                            (int(float(customer_count)), day_of_week, holiday_flag, date_str)
-                        )
+            except sqlite3.IntegrityError:
+                cursor.execute(
+                    "UPDATE CustomerCount SET customer_count = ?, day_of_week = ?, is_holiday = ? WHERE count_date = ?",
+                    (int(round(customer_count)), day_of_week, holiday_flag, date_str)
+                )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
-    # Log the upload in Dataset table
     if count > 0:
         log_dataset_upload(filename, uploaded_by_user_id, count)
 
@@ -440,11 +523,8 @@ def get_alerts():
     return df
 
 def generate_demand_alerts(predictions, model_used="ARIMA"):
-    """
-    Compare predicted customer count to historical average.
-    Generate Alert records only for days where demand is ±20% from average.
-    Deletes ALL previous alerts first so re-running never duplicates.
-    """
+    """Flag days where predicted demand is +-20% from the historical average.
+    Deletes all previous alerts first so re-running never duplicates."""
     if not predictions or not predictions.get("customer_forecast"):
         return
 
@@ -459,7 +539,6 @@ def generate_demand_alerts(predictions, model_used="ARIMA"):
     threshold_high = avg_customers * 1.20
     threshold_low  = avg_customers * 0.80
 
-    # Use a single connection — delete all old alerts then insert fresh ones atomically
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("DELETE FROM Alert")
