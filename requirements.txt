@@ -1,11 +1,11 @@
 streamlit
-   pandas
-   numpy
-   scikit-learn
-   xgboost
-   statsmodels
-   plotly
-   openpyxl
-   bcrypt
-   tensorflow-cpu
-   protobuf
+pandas
+numpy
+scikit-learn
+xgboost
+statsmodels
+plotly
+openpyxl
+bcrypt
+tensorflow-cpu
+protobuf
