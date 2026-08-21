@@ -1,0 +1,21 @@
+series,model,test_days,MAE,RMSE,MAPE
+Customer Count,ARIMA,7,6.854,8.843,17.14
+Customer Count,XGBoost,7,40.281,40.925,105.75
+Customer Count,LSTM,7,5.663,6.88,11.33
+Customer Count,Naive,7,3.286,3.485,7.83
+Biryani,ARIMA,7,4.55,5.861,15.67
+Biryani,XGBoost,7,21.827,24.644,94.92
+Biryani,LSTM,7,3.708,4.135,11.6
+Biryani,Naive,7,2.143,2.42,6.88
+Chicken Karahi,ARIMA,7,2.533,3.33,15.63
+Chicken Karahi,XGBoost,7,11.875,13.408,91.37
+Chicken Karahi,LSTM,7,2.455,2.773,13.87
+Chicken Karahi,Naive,7,1.143,1.414,6.5
+Naan,ARIMA,7,10.168,13.155,16.96
+Naan,XGBoost,7,58.463,62.973,101.0
+Naan,LSTM,7,10.495,13.13,14.88
+Naan,Naive,7,4.857,5.127,7.8
+Water,ARIMA,7,6.012,7.74,16.24
+Water,XGBoost,7,28.118,31.631,94.88
+Water,LSTM,7,5.902,6.954,14.1
+Water,Naive,7,2.714,3.047,6.66
