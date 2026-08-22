@@ -14,7 +14,7 @@ from auth.auth_manager import create_user, authenticate_user, get_all_users, del
 from data.data_manager import (
     add_food_item, get_all_food_items, get_food_item_by_name,
     add_sale, add_customer_count, get_all_sales, get_customer_counts,
-    bulk_upload_sales, get_predictions, get_inventory_suggestions,
+    bulk_upload_sales, infer_schema, get_predictions, get_inventory_suggestions,
     get_alerts, generate_demand_alerts, save_inventory_suggestion,
     get_dataset_uploads, save_prediction
 )
@@ -382,21 +382,55 @@ def page_upload_dataset():
         df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
         st.success(f"File loaded: {uploaded_file.name}")
         st.subheader("Data Preview")
-        
+
         st.table(df.head(10).set_index(df.columns[0]))
-        
         info_text(f"Total rows: {len(df)}")
+
+        st.subheader("Detected Columns")
         info_text(
-            "Columns are matched automatically (e.g. `Qty`, `Product`, `Order Date` all work) - "
-            "no need for exact names. Multiple rows for the same item/date are aggregated automatically."
+            "The app scanned your headers and your actual data to figure out what each column "
+            "represents - it doesn't need exact header names. Check the results below and fix "
+            "anything that's wrong before importing."
         )
 
-        if st.button("Save to Database", use_container_width=True, type="primary"):
-            count = bulk_upload_sales(df, uploaded_by_user_id=st.session_state.user['user_id'], filename=uploaded_file.name)
-            if count > 0:
-                st.success(f"Saved {count} sales records (after cleaning/aggregating duplicates). Holiday flags auto-applied.")
+        schema = infer_schema(df)
+        col_options = ["-- none --"] + list(df.columns)
+        labels = {
+            'item': 'Item / Food Name', 'quantity': 'Quantity',
+            'date': 'Date', 'customer_count': 'Customer Count (optional)',
+        }
+
+        chosen = {}
+        ui_cols = st.columns(4)
+        for i, key in enumerate(['item', 'quantity', 'date', 'customer_count']):
+            detected = schema[key]['column']
+            default_idx = col_options.index(detected) if detected in col_options else 0
+            with ui_cols[i]:
+                chosen[key] = st.selectbox(labels[key], col_options, index=default_idx, key=f"colsel_{key}")
+                conf = schema[key]['confidence']
+                if conf == 'name':
+                    st.caption("🟢 matched by header")
+                elif conf == 'content':
+                    st.caption("🟡 inferred from data")
+                elif key != 'customer_count':
+                    st.caption("🔴 not detected - select manually")
+                if schema[key]['sample']:
+                    st.caption(f"e.g. {', '.join(map(str, schema[key]['sample']))}")
+
+        st.divider()
+        if st.button("Confirm & Save to Database", use_container_width=True, type="primary"):
+            column_map = {k: (v if v != "-- none --" else None) for k, v in chosen.items()}
+            if not column_map['item'] or not column_map['quantity'] or not column_map['date']:
+                st.error("Item, Quantity, and Date columns are required - please select them above.")
             else:
-                st.warning("No records saved - see the message above for details.")
+                count = bulk_upload_sales(
+                    df, uploaded_by_user_id=st.session_state.user['user_id'],
+                    filename=uploaded_file.name, column_map=column_map,
+                )
+                if count > 0:
+                    st.success(f"Saved {count} sales records (after cleaning/aggregating duplicates). Holiday flags auto-applied.")
+                else:
+                    st.warning("No records saved - see the message above for details.")
 
     st.divider()
     st.subheader("Upload History")

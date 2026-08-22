@@ -3,6 +3,7 @@ import sqlite3
 import os
 import re
 import difflib
+import warnings
 import pandas as pd
 from datetime import datetime
 import streamlit as st  # Added for frontend warnings during bulk upload
@@ -279,7 +280,8 @@ def get_dataset_uploads():
 # Synonym lists for fuzzy column matching against messy POS export headers.
 COLUMN_ALIASES = {
     'item':           ['item', 'item_name', 'fooditem', 'food_item', 'product',
-                        'product_name', 'menu_item', 'dish', 'sku', 'name'],
+                        'product_name', 'menu_item', 'dish', 'dish_name', 'food_name',
+                        'sku', 'name'],
     'quantity':       ['quantity', 'qty', 'amount', 'units', 'units_sold',
                         'sold', 'count', 'sales', 'unitssold'],
     'date':           ['date', 'sale_date', 'order_date', 'transaction_date',
@@ -293,6 +295,139 @@ COLUMN_ALIASES = {
 def _normalize_col(col):
     """Lowercase + strip non-alphanumerics so 'Order Date' == 'order_date' == 'OrderDate'."""
     return re.sub(r'[^a-z0-9]', '', str(col).lower())
+
+
+def infer_schema(df):
+    """Figures out which uploaded columns are item / quantity / date / customer_count -
+    first by header name, then, for anything the header doesn't give away, by looking
+    at the actual data (parses-as-date rate, numeric-vs-text, and whether a numeric
+    column repeats one value per day like a daily total vs varies per row like a quantity).
+
+    Returns {key: {'column': str|None, 'confidence': 'name'|'content'|None,
+                    'reason': str, 'sample': [str, ...]}}
+    """
+    keys = ('item', 'quantity', 'date', 'customer_count')
+    result = {k: {'column': None, 'confidence': None, 'reason': '', 'sample': []} for k in keys}
+    claimed = set()
+
+    # Pass 1: header-name matching (existing alias/fuzzy engine)
+    for key in keys:
+        col = _match_column(df.columns, key)
+        if col:
+            claimed.add(col)
+            result[key] = {
+                'column': col, 'confidence': 'name',
+                'reason': f"header \"{col}\" matches known {key.replace('_', ' ')} names",
+                'sample': df[col].dropna().astype(str).head(3).tolist(),
+            }
+
+    remaining = [c for c in df.columns if c not in claimed]
+
+    # Pass 2: date, by content - highest %-of-values-parse-as-a-date wins.
+    # Bare numbers like "18" or "32" also technically parse under a loose date
+    # parser (dateutil will read them as a day-of-month), so we only consider a
+    # column date-like if most values actually look structured (contain a
+    # separator or letters, e.g. "2026-08-01" or "Aug 1 2026") - not just digits.
+    if not result['date']['column']:
+        best_col, best_rate = None, 0.0
+        for c in remaining:
+            str_vals = df[c].dropna().astype(str)
+            if str_vals.empty:
+                continue
+            structured = (str_vals.str.contains(r'[-/]', regex=True) |
+                          str_vals.str.contains(r'[A-Za-z]', regex=True)).mean()
+            if structured < 0.5:
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                rate = pd.to_datetime(df[c], errors='coerce').notna().mean()
+            if rate > 0.8 and rate > best_rate:
+                best_col, best_rate = c, rate
+        if best_col:
+            claimed.add(best_col); remaining.remove(best_col)
+            result['date'] = {
+                'column': best_col, 'confidence': 'content',
+                'reason': f"{best_rate:.0%} of values parse as valid dates",
+                'sample': df[best_col].dropna().astype(str).head(3).tolist(),
+            }
+
+    date_col = result['date']['column']
+
+    # Pass 3: numeric columns -> tell quantity apart from customer_count by behavior,
+    # not just name: customer_count repeats ONE value per date (a daily total),
+    # quantity varies row-by-row (a per-item number) even within the same date.
+    numeric_candidates = []
+    for c in remaining:
+        cleaned = df[c].apply(_clean_numeric)
+        if cleaned.notna().mean() > 0.8:
+            numeric_candidates.append((c, cleaned))
+
+    if numeric_candidates and date_col:
+        date_parsed = pd.to_datetime(df[date_col], errors='coerce')
+        scored = []
+        for c, cleaned in numeric_candidates:
+            tmp = pd.DataFrame({'_d': date_parsed, '_v': cleaned}).dropna()
+            if tmp.empty:
+                continue
+            constant_ratio = (tmp.groupby('_d')['_v'].nunique() == 1).mean()
+            scored.append((c, cleaned, constant_ratio))
+        scored.sort(key=lambda x: -x[2])
+
+        if not result['customer_count']['column'] and len(scored) > 1 and scored[0][2] > 0.7:
+            c, cleaned, ratio = scored[0]
+            claimed.add(c)
+            result['customer_count'] = {
+                'column': c, 'confidence': 'content',
+                'reason': f"same value repeats for every row on a given date ({ratio:.0%} of dates) "
+                          "- reads like a daily total, not a per-item quantity",
+                'sample': cleaned.dropna().astype(str).head(3).tolist(),
+            }
+
+        if not result['quantity']['column']:
+            leftover = [(c, cleaned) for c, cleaned, _ in scored if c not in claimed]
+            if leftover:
+                c, cleaned = leftover[0]
+                claimed.add(c)
+                result['quantity'] = {
+                    'column': c, 'confidence': 'content',
+                    'reason': "numeric column that varies row-by-row - reads like a per-item quantity",
+                    'sample': cleaned.dropna().astype(str).head(3).tolist(),
+                }
+    elif numeric_candidates and not result['quantity']['column']:
+        c, cleaned = numeric_candidates[0]
+        claimed.add(c)
+        result['quantity'] = {
+            'column': c, 'confidence': 'content',
+            'reason': "numeric column - reads like a quantity",
+            'sample': cleaned.dropna().astype(str).head(3).tolist(),
+        }
+
+    remaining = [c for c in df.columns if c not in claimed]
+
+    # Pass 4: item -> the leftover text column with repeating (not unique-per-row) values
+    if not result['item']['column']:
+        candidates = []
+        for c in remaining:
+            s = df[c].astype(str)
+            n_unique, n = s.nunique(), len(s)
+            if n_unique < 2 or n_unique > max(2, int(n * 0.9)):
+                continue
+            numeric_rate = df[c].apply(_clean_numeric).notna().mean()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                date_rate = pd.to_datetime(df[c], errors='coerce').notna().mean()
+            if numeric_rate < 0.5 and date_rate < 0.5:
+                candidates.append((c, n_unique))
+        if candidates:
+            candidates.sort(key=lambda x: x[1])
+            c, n_unique = candidates[0]
+            result['item'] = {
+                'column': c, 'confidence': 'content',
+                'reason': f"text column with {n_unique} repeating distinct values - reads like item/product names",
+                'sample': df[c].dropna().astype(str).unique()[:3].tolist(),
+            }
+
+    return result
 
 
 def _match_column(df_columns, target_key):
@@ -340,19 +475,30 @@ def _clean_numeric(value):
         return None
 
 
-def bulk_upload_sales(df, uploaded_by_user_id=None, filename="unknown"):
-    """Import a sales CSV/Excel export: fuzzy-matches messy headers, cleans dirty
-    numeric fields, aggregates duplicate item/date rows, and drops future dates."""
+def bulk_upload_sales(df, uploaded_by_user_id=None, filename="unknown", column_map=None):
+    """Import a sales CSV/Excel export: cleans dirty numeric fields, aggregates
+    duplicate item/date rows, and drops future dates.
+
+    column_map: optional {'item': col, 'quantity': col, 'date': col, 'customer_count': col}
+    from a user-confirmed infer_schema() review step. If omitted, falls back to
+    blind auto-matching via _match_column (old behavior, kept for compatibility).
+    """
     if df is None or df.empty:
         st.warning("The uploaded file is empty.")
         return 0
 
     df = df.copy()
 
-    item_col = _match_column(df.columns, 'item')
-    qty_col  = _match_column(df.columns, 'quantity')
-    date_col = _match_column(df.columns, 'date')
-    cust_col = _match_column(df.columns, 'customer_count')
+    if column_map:
+        item_col = column_map.get('item')
+        qty_col  = column_map.get('quantity')
+        date_col = column_map.get('date')
+        cust_col = column_map.get('customer_count')
+    else:
+        item_col = _match_column(df.columns, 'item')
+        qty_col  = _match_column(df.columns, 'quantity')
+        date_col = _match_column(df.columns, 'date')
+        cust_col = _match_column(df.columns, 'customer_count')
 
     missing = [name for name, col in
                [('item', item_col), ('quantity', qty_col), ('date', date_col)] if not col]
